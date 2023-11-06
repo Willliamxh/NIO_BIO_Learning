@@ -301,5 +301,272 @@ native void socketBind(InetAddress address, int port)
 
 ​	于是，我们来分析下`ServerSocket.accept`方法的源码过程:
 
+```java
+public Socket accept() throws IOException {
+    if (isClosed())
+        throw new SocketException("Socket is closed");
+    if (!isBound())
+        throw new SocketException("Socket is not bound yet");
+    Socket s = new Socket((SocketImpl) null);
+    implAccept(s);
+    return s;
+}
+
+```
+
+首先进行的是一些判断，接着创建了一个Socket对象（为什么这里要创建一个Socket对象，后面会讲到），执行了implAccept方法，来看看implAccept方法：
+
+```java
+/**
+* Subclasses of ServerSocket use this method to override accept()
+* to return their own subclass of socket.  So a FooServerSocket
+* will typically hand this method an <i>empty</i> FooSocket.  On
+* return from implAccept the FooSocket will be connected to a client.
+*
+* @param s the Socket
+* @throws java.nio.channels.IllegalBlockingModeException
+*         if this socket has an associated channel,
+*         and the channel is in non-blocking mode
+* @throws IOException if an I/O error occurs when waiting
+* for a connection.
+* @since   1.1
+* @revised 1.4
+* @spec JSR-51
+*/
+protected final void implAccept(Socket s) throws IOException {
+SocketImpl si = null;
+try {
+    if (s.impl == null)
+        s.setImpl();
+    else {
+        s.impl.reset();
+    }
+    si = s.impl;
+    s.impl = null;
+    si.address = new InetAddress();
+    si.fd = new FileDescriptor();
+    getImpl().accept(si);  // <1>
+    SocketCleanable.register(si.fd);   // raw fd has been set
+
+    SecurityManager security = System.getSecurityManager();
+    if (security != null) {
+        security.checkAccept(si.getInetAddress().getHostAddress(),
+                                si.getPort());
+    }
+} catch (IOException e) {
+    if (si != null)
+        si.reset();
+    s.impl = si;
+    throw e;
+} catch (SecurityException e) {
+    if (si != null)
+        si.reset();
+    s.impl = si;
+    throw e;
+}
+s.impl = si;
+s.postAccept();
+}
+
+```
+
+上面执行了<1>处getImpl的accept方法之后，我们在AbstractPlainSocketImpl找到accept方法：
+
+```java
+//java.net.AbstractPlainSocketImpl#accept
+/**
+* Accepts connections.
+* @param s the connection
+*/
+protected void accept(SocketImpl s) throws IOException {
+  acquireFD();
+  try {
+      socketAccept(s);
+  } finally {
+      releaseFD();
+  }
+}
+
+```
+
+可以看到他调用了socketAccept方法，因为每个操作系统的Socket地实现都不同，所以这里Windows下就执行了我们PlainSocketImpl里面的socketAccept方法:
+
+```java
+// java.net.PlainSocketImpl#socketAccept
+@Override
+void socketAccept(SocketImpl s) throws IOException {
+    int nativefd = checkAndReturnNativeFD();
+
+    if (s == null)
+        throw new NullPointerException("socket is null");
+
+    int newfd = -1;
+    InetSocketAddress[] isaa = new InetSocketAddress[1];
+    if (timeout <= 0) {  //<1>
+        newfd = accept0(nativefd, isaa); // <2>
+    } else {
+        configureBlocking(nativefd, false);
+        try {
+            waitForNewConnection(nativefd, timeout);
+            newfd = accept0(nativefd, isaa);  // <3>
+            if (newfd != -1) {
+                configureBlocking(newfd, true);
+            }
+        } finally {
+            configureBlocking(nativefd, true);
+        }
+    } // <4>
+    /* Update (SocketImpl)s' fd */
+    fdAccess.set(s.fd, newfd);
+    /* Update socketImpls remote port, address and localport */
+    InetSocketAddress isa = isaa[0];
+    s.port = isa.getPort();
+    s.address = isa.getAddress();
+    s.localport = localport;
+    if (preferIPv4Stack && !(s.address instanceof Inet4Address))
+        throw new SocketException("Protocol family not supported");
+}
+//java.net.PlainSocketImpl#accept0
+ static native int accept0(int fd, InetSocketAddress[] isaa) throws IOException;
+
+```
+
+mac linux版本：直接进native方法了
+
+```
+ native void socketAccept(SocketImpl s) throws IOException;
+```
+
+​    这里<1>到<4>之间是我们关注的代码，<2>和<3>执行了accept0方法，这个是native方法，具体来说就是与操作系统交互来实现监听指定端口上是否有客户端接入，正是因为accept0在没有客户端接入的时候会一直处于阻塞状态，所以造成了我们程序级别的accept方法阻塞。当然对于程序级别的阻塞，我们是可以避免的，也就是我们可以将accept方法修改成非阻塞式，但是对于accept0造成的阻塞我们暂时是没法改变的，操作系统级别的阻塞其实就是我们通常所说的同步异步中的同步了。 
+
+​	前面说到我们可以在程序级别改变accept的阻塞，具体怎么实现？其实就是通过我们上面socketAccept方法中判断timeout的值来实现，在第<1>处判断timeout的值如果小于等于0，那么直接执行accept0方法，这时候将一直处于阻塞状态，但是如果我们设置了timeout的话，即timeout值大于0的话，则程序会在等到我们设置的时间后返回，注意这里的newfd如果等于-1的话，表示这次accept没有发现有数据从底层返回；那么到底timeout的值是在哪设置？我们可以通过ServerSocket的setSoTimeout方法进行设置，来看看这个方法：
+
+```java
+// java.net.ServerSocket#setSoTimeout
+/**
+* Enable/disable {@link SocketOptions#SO_TIMEOUT SO_TIMEOUT} with the
+* specified timeout, in milliseconds.  With this option set to a non-zero
+* timeout, a call to accept() for this ServerSocket
+* will block for only this amount of time.  If the timeout expires,
+* a <B>java.net.SocketTimeoutException</B> is raised, though the
+* ServerSocket is still valid.  The option <B>must</B> be enabled
+* prior to entering the blocking operation to have effect.  The
+* timeout must be {@code > 0}.
+* A timeout of zero is interpreted as an infinite timeout.
+* @param timeout the specified timeout, in milliseconds
+* @exception SocketException if there is an error in
+* the underlying protocol, such as a TCP error.
+* @since   1.1
+* @see #getSoTimeout()
+*/
+public synchronized void setSoTimeout(int timeout) throws SocketException {
+  if (isClosed())
+      throw new SocketException("Socket is closed");
+  getImpl().setOption(SocketOptions.SO_TIMEOUT, timeout);
+}
+
+```
+
+其执行了getImpl的setOption方法，并且设置了timeout时间，这里，我们从AbstractPlainSocketImpl中查看：
+
+```java
+//java.net.AbstractPlainSocketImpl#setOption
+public void setOption(int opt, Object val) throws SocketException {
+    if (isClosedOrPending()) {
+        throw new SocketException("Socket Closed");
+    }
+    boolean on = true;
+    switch (opt) {
+        /* check type safety b4 going native.  These should never
+            * fail, since only java.Socket* has access to
+            * PlainSocketImpl.setOption().
+            */
+    case SO_LINGER:
+        if (val == null || (!(val instanceof Integer) && !(val instanceof Boolean)))
+            throw new SocketException("Bad parameter for option");
+        if (val instanceof Boolean) {
+            /* true only if disabling - enabling should be Integer */
+            on = false;
+        }
+        break;
+    case SO_TIMEOUT: //<1>
+        if (val == null || (!(val instanceof Integer)))
+            throw new SocketException("Bad parameter for SO_TIMEOUT");
+        int tmp = ((Integer) val).intValue();
+        if (tmp < 0)
+            throw new IllegalArgumentException("timeout < 0");
+        timeout = tmp;
+        break;
+    case IP_TOS:
+            if (val == null || !(val instanceof Integer)) {
+                throw new SocketException("bad argument for IP_TOS");
+            }
+            trafficClass = ((Integer)val).intValue();
+            break;
+    case SO_BINDADDR:
+        throw new SocketException("Cannot re-bind socket");
+    case TCP_NODELAY:
+        if (val == null || !(val instanceof Boolean))
+            throw new SocketException("bad parameter for TCP_NODELAY");
+        on = ((Boolean)val).booleanValue();
+        break;
+    case SO_SNDBUF:
+    case SO_RCVBUF:
+        if (val == null || !(val instanceof Integer) ||
+            !(((Integer)val).intValue() > 0)) {
+            throw new SocketException("bad parameter for SO_SNDBUF " +
+                                        "or SO_RCVBUF");
+        }
+        break;
+    case SO_KEEPALIVE:
+        if (val == null || !(val instanceof Boolean))
+            throw new SocketException("bad parameter for SO_KEEPALIVE");
+        on = ((Boolean)val).booleanValue();
+        break;
+    case SO_OOBINLINE:
+        if (val == null || !(val instanceof Boolean))
+            throw new SocketException("bad parameter for SO_OOBINLINE");
+        on = ((Boolean)val).booleanValue();
+        break;
+    case SO_REUSEADDR:
+        if (val == null || !(val instanceof Boolean))
+            throw new SocketException("bad parameter for SO_REUSEADDR");
+        on = ((Boolean)val).booleanValue();
+        break;
+    case SO_REUSEPORT:
+        if (val == null || !(val instanceof Boolean))
+            throw new SocketException("bad parameter for SO_REUSEPORT");
+        if (!supportedOptions().contains(StandardSocketOptions.SO_REUSEPORT))
+            throw new UnsupportedOperationException("unsupported option");
+        on = ((Boolean)val).booleanValue();
+        break;
+    default:
+        throw new SocketException("unrecognized TCP option: " + opt);
+    }
+    socketSetOption(opt, on, val);
+}
+
+```
+
+这个方法比较长，我们仅看与`timeout`有关的代码，即<1>处的代码。其实这里仅仅就是将我们setOption里面传入的timeout值设置到了AbstractPlainSocketImpl的全局变量timeout里而已。
+
+这样，我们就可以在程序级别将accept方法设置成为非阻塞式的了，但是read方法现在还是阻塞式的，即后面我们还需要改造read方法，同样将它在程序级别上变成非阻塞式。
+
+原理可见：https://blog.csdn.net/weixin_43710268/article/details/109712344
+
+​		当调用socket.getInputStream().read()方法时,由于这个read()方法是阻塞的,read()方法会一直处于阻塞状态等待接受数据而导致不能往下执行代码;而setSoTimeout()方法就是设置阻塞的超时时间。当设置了超时时间后,如果read()方法读不到数据,处于等待读取数据的状态时,就会开始计算超时时间，当到达超时时间还没有新的数据可以读取的时候,read()方法就会抛出io异常,结束read()方法的阻塞状态;如果到达超时时间前,从缓冲区读取到了数据,那么就重新计算超时时间。
+
+## 通过Demo改造来进行accept的非阻塞实现
+
+在正式改造前，我们有必要来解释下Socket下同步/异步和阻塞/非阻塞:
+
+**同步/异步**是属于操作系统级别的，指的是操作系统在收到程序请求的IO之后，如果IO资源没有准备好的话，该如何响应程序的问题，同步的话就是不响应，直到IO资源准备好；而异步的话则会返回给程序一个标志，这个标志用于当IO资源准备好后通过事件机制发送的内容应该发到什么地方。
+
+阻塞/非阻塞是属于程序级别的，指的是程序在请求操作系统进行IO操作时，如果IO资源没有准备好的话，程序该怎么处理的问题，阻塞的话就是程序什么都不做，一直等到IO资源准备好，非阻塞的话程序则继续运行，但是会时不时的去查看下IO到底准备好没有呢；
+
+我们通常见到的BIO是同步阻塞式的，同步的话说明操作系统底层是一直等待IO资源准备直到ok的，阻塞的话是程序本身也在一直等待IO资源准备直到ok，具体来讲程序级别的阻塞就是accept和read造成的，我们可以通过改造将其变成非阻塞式，但是操作系统层次的阻塞我们没法改变。
+
+我们的NIO是同步非阻塞式的，其实它的非阻塞实现原理和我们上面的讲解差不多的，就是为了改善accept和read方法带来的阻塞现象，所以引入了`Channel`和`Buffer`的概念。 好了，我们对我们的Demo进行改进，解决accept带来的阻塞问题(为多个客户端连接做的异步处理，这里就不多解释了，读者可自行思考，实在不行可到知秋相关视频中找到对应解读)：
+
 
 
