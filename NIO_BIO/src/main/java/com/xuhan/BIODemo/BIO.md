@@ -8,6 +8,8 @@ Rxjava源码解读与分享：[www.bilibili.com/video/av345…](https://link.jue
 
 Reactor源码解读与分享：[www.bilibili.com/video/av353…](https://link.juejin.cn?target=https%3A%2F%2Fwww.bilibili.com%2Fvideo%2Fav35326911)
 
+其它大佬的分享：https://mdnice.com/writing/038282d3d7084f3ab2bfe651ca4ee8db
+
 ## 引入
 
 我们通过一个BIO的Demo来展示其用法:
@@ -295,7 +297,7 @@ native void socketBind(InetAddress address, int port)
 
    这里，我们还要了解的是，使用了多线程只是能够实现对"业务逻辑处理"的多线程，但是对于数据报文的接收还是需要一个一个来的，也就是我们上面Demo中见到的accept以及read方法阻塞问题，多线程是根本解决不了的。
 
-​	那么首先我们来看看accept为什么会造成阻塞，accept方法的作用是询问操作系统是否有新的Socket套接字信息从端口XXX处发送过来，注意这里询问的是操作系统，也就是说Socket套接字IO模式的支持是基于操作系统的，如果操作系统没有发现有套接字从指定端口XXX连接进来，那么操作系统就会等待，这样accept方法就会阻塞，他的内部实现使用的是操作系统级别的同步IO。
+​	那么首先我们来看看accept为什么会造成阻塞，accept方法的作用是询问操作系统是否有新的Socket套接字信息从端口XXX处发送过来，注意这里询问的是操作系统，也就是说Socket套接字IO模式的支持是基于操作系统的，如果操作系统没有发现有套接字从指定端口XXX连接进来，那么操作系统就会等待，这样accept方法就会阻塞，他的内部实现使用的是操作系统级别的同步IO。（有来才有往）
 
 ## ServerSocket中accept解读
 
@@ -332,6 +334,9 @@ public Socket accept() throws IOException {
 * @since   1.1
 * @revised 1.4
 * @spec JSR-51
+	 1.accept函数返回的新socket其实指代的是本次创建的连接，而一个连接是包括两部分信息的，一个是源IP和源端口，另一个是宿IP和宿端口。所以，accept可以产生多个不同的socket，而这些socket里包含的宿IP和宿端口是不变的，变化的只是源IP和源端口。
+	 2.个人认为整个accept() 操作比较”恶心“（个人观点）的是几个引用的赋值变化上面，暂时”解绑“的目的是在进行底层Socket连接的时候，如果Socket出现异常也没有影响，此时Socket持有的引用也是null，可以无阻碍的重新进行下一次Socket连接。
+	换句话说，整个Socket要么对接成功，要么就是重置回没对接之前的状态可以进行下一次尝试，保证ServerSocket会收到一个没有任何异常的Socket连接。
 */
 protected final void implAccept(Socket s) throws IOException {
 SocketImpl si = null;
@@ -343,8 +348,10 @@ try {
     }
     si = s.impl;
     s.impl = null;
+  	//这边初始化地址和文件描述符，但其实都是空的
     si.address = new InetAddress();
     si.fd = new FileDescriptor();
+  	//这边去设定来源ip和来源文件描述符 文件描述符：描述连接状态 0 in 1 out 2 error -1什么都无这种
     getImpl().accept(si);  // <1>
     SocketCleanable.register(si.fd);   // raw fd has been set
 
@@ -556,6 +563,8 @@ public void setOption(int opt, Object val) throws SocketException {
 
 ​		当调用socket.getInputStream().read()方法时,由于这个read()方法是阻塞的,read()方法会一直处于阻塞状态等待接受数据而导致不能往下执行代码;而setSoTimeout()方法就是设置阻塞的超时时间。当设置了超时时间后,如果read()方法读不到数据,处于等待读取数据的状态时,就会开始计算超时时间，当到达超时时间还没有新的数据可以读取的时候,read()方法就会抛出io异常,结束read()方法的阻塞状态;如果到达超时时间前,从缓冲区读取到了数据,那么就重新计算超时时间。
 
+![image-20231109155341733](/Users/xuhan/program/program/workLearning/Learn_NIO_BIO/NIO_BIO/src/main/java/com/xuhan/BIODemo/BIO.assets/image-20231109155341733.png)
+
 ## 通过Demo改造来进行accept的非阻塞实现
 
 在正式改造前，我们有必要来解释下Socket下同步/异步和阻塞/非阻塞:
@@ -568,5 +577,106 @@ public void setOption(int opt, Object val) throws SocketException {
 
 我们的NIO是同步非阻塞式的，其实它的非阻塞实现原理和我们上面的讲解差不多的，就是为了改善accept和read方法带来的阻塞现象，所以引入了`Channel`和`Buffer`的概念。 好了，我们对我们的Demo进行改进，解决accept带来的阻塞问题(为多个客户端连接做的异步处理，这里就不多解释了，读者可自行思考，实在不行可到知秋相关视频中找到对应解读)：
 
+```java
+public class BIOProNotB {
 
+    public void initBIOServer(int port) {
+        ServerSocket serverSocket = null;//服务端Socket
+        Socket socket = null;//客户端socket
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        ClientSocketThread thread = null;
+        try {
+            serverSocket = new ServerSocket(port);
+            serverSocket.setSoTimeout(1000);
+            System.out.println(stringNowTime() + ": serverSocket started");
+            while (true) {
+                try {
+                    socket = serverSocket.accept();
+                } catch (SocketTimeoutException e) {
+                    //运行到这里表示本次accept是没有收到任何数据的，服务端的主线程在这里可以做一些其他事情
+                    System.out.println("now time is: " + stringNowTime());
+                    continue;
+                }
+                System.out.println(stringNowTime() + ": id为" + socket.hashCode() + "的Clientsocket connected");
+                thread = new ClientSocketThread(socket);
+                threadPool.execute(thread);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public String stringNowTime() {
+        SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss:SSS");
+        return format.format(new Date());
+    }
+
+    class ClientSocketThread extends Thread {
+        public Socket socket;
+
+        public ClientSocketThread(Socket socket) {
+            this.socket = socket;
+        }
+
+        @Override
+        public void run() {
+            BufferedReader reader = null;
+            String inputContent;
+            int count = 0;
+            try {
+                reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                while ((inputContent = reader.readLine()) != null) {
+                    System.out.println("收到id为" + socket.hashCode() + "  " + inputContent);
+                    count++;
+                }
+                System.out.println("id为" + socket.hashCode() + "的Clientsocket " + stringNowTime() + "读取结束");
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    reader.close();
+                    socket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        BIOProNotB server = new BIOProNotB();
+        server.initBIOServer(8888);
+    }
+
+
+}
+
+```
+
+​	因为我们的ServerSocket设置了timeout时间，这样的话调用accept方法的时候每隔1s他就会被唤醒一次，而不再是一直在那里，只有有客户端接入才会返回信息；我们运行一下看看结果：
+
+```
+2019-01-02 17:28:43:362: serverSocket started
+now time is: 2019-01-02 17:28:44:363
+now time is: 2019-01-02 17:28:45:363
+now time is: 2019-01-02 17:28:46:363
+now time is: 2019-01-02 17:28:47:363
+now time is: 2019-01-02 17:28:48:363
+now time is: 2019-01-02 17:28:49:363
+now time is: 2019-01-02 17:28:50:363
+now time is: 2019-01-02 17:28:51:364
+now time is: 2019-01-02 17:28:52:365
+now time is: 2019-01-02 17:28:53:365
+now time is: 2019-01-02 17:28:54:365
+now time is: 2019-01-02 17:28:55:365
+now time is: 2019-01-02 17:28:56:365 // <1>
+2019-01-02 17:28:56:911: id为1308927845的Clientsocket connected
+now time is: 2019-01-02 17:28:57:913 // <2>
+now time is: 2019-01-02 17:28:58:913
+
+```
+
+可以看到，我们刚开始并没有客户端接入的时候，是会执行`System.out.println("now time is: " + stringNowTime());`的输出，还有一点需要注意的就是，仔细看看上面的输出结果的标记<1>与<2>，你会发现<2>处时间值不是17:28:57:365，原因就在于如果accept正常返回值的话，是不会执行catch语句部分的。
+
+## 通过Demo改造来进行read的非阻塞实现
 
