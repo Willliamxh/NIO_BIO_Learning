@@ -680,3 +680,369 @@ now time is: 2019-01-02 17:28:58:913
 
 ## 通过Demo改造来进行read的非阻塞实现
 
+在正式改造前，我们有必要来解释下Socket下同步/异步和阻塞/非阻塞:
+
+同步/异步是属于操作系统级别的，指的是操作系统在收到程序请求的IO之后，如果IO资源没有准备好的话，该如何响应程序的问题，同步的话就是不响应，直到IO资源准备好；而异步的话则会返回给程序一个标志，这个标志用于当IO资源准备好后通过事件机制发送的内容应该发到什么地方。
+
+阻塞/非阻塞是属于程序级别的，指的是程序在请求操作系统进行IO操作时，如果IO资源没有准备好的话，程序该怎么处理的问题，阻塞的话就是程序什么都不做，一直等到IO资源准备好，非阻塞的话程序则继续运行，但是会时不时的去查看下IO到底准备好没有呢；
+
+我们通常见到的BIO是同步阻塞式的，同步的话说明操作系统底层是一直等待IO资源准备直到ok的，阻塞的话是程序本身也在一直等待IO资源准备直到ok，具体来讲程序级别的阻塞就是accept(serverSocket)和read（socket）造成的，我们可以通过改造将其变成非阻塞式，但是操作系统层次的阻塞我们没法改变。
+
+我们的NIO是同步非阻塞式的，其实它的非阻塞实现原理和我们上面的讲解差不多的，就是为了改善accept和read方法带来的阻塞现象，所以引入了`Channel`和`Buffer`的概念。 好了，我们对我们的Demo进行改进，解决accept带来的阻塞问题(为多个客户端连接做的异步处理，这里就不多解释了，读者可自行思考，实在不行可到本人相关视频中找到对应解读)：
+
+```java
+public class BIOProNotB {
+
+    public void initBIOServer(int port) {
+        ServerSocket serverSocket = null;//服务端Socket
+        Socket socket = null;//客户端socket
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        ClientSocketThread thread = null;
+        try {
+            serverSocket = new ServerSocket(port);
+            serverSocket.setSoTimeout(1000);
+            System.out.println(stringNowTime() + ": serverSocket started");
+            while (true) {
+                try {
+                    socket = serverSocket.accept();
+                } catch (SocketTimeoutException e) {
+                    //运行到这里表示本次accept是没有收到任何数据的，服务端的主线程在这里可以做一些其他事情
+                    System.out.println("now time is: " + stringNowTime());
+                    continue;
+                }
+                System.out.println(stringNowTime() + ": id为" + socket.hashCode() + "的Clientsocket connected");
+                thread = new ClientSocketThread(socket);
+                threadPool.execute(thread);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public String stringNowTime() {
+        SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss:SSS");
+        return format.format(new Date());
+    }
+
+    class ClientSocketThread extends Thread {
+        public Socket socket;
+
+        public ClientSocketThread(Socket socket) {
+            this.socket = socket;
+        }
+
+        @Override
+        public void run() {
+            BufferedReader reader = null;
+            String inputContent;
+            int count = 0;
+            try {
+                reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                while ((inputContent = reader.readLine()) != null) {
+                    System.out.println("收到id为" + socket.hashCode() + "  " + inputContent);
+                    count++;
+                }
+                System.out.println("id为" + socket.hashCode() + "的Clientsocket " + stringNowTime() + "读取结束");
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    reader.close();
+                    socket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        BIOProNotB server = new BIOProNotB();
+        server.initBIOServer(8888);
+    }
+
+
+}
+
+```
+
+1.为我们的ServerSocket设置了timeout时间，这样的话调用accept方法的时候每隔1s他就会被唤醒一次，而不再是一直在那里，只有有客户端接入才会返回信息；
+
+2.通过多线程去接入不同的客户端，不会有“一核繁忙，多核等待”的情况。如果没有这个多线程，一次只能接入一个客户端。
+
+我们运行一下看看结果：
+
+```
+2019-01-02 17:28:43:362: serverSocket started
+now time is: 2019-01-02 17:28:44:363
+now time is: 2019-01-02 17:28:45:363
+now time is: 2019-01-02 17:28:46:363
+now time is: 2019-01-02 17:28:47:363
+now time is: 2019-01-02 17:28:48:363
+now time is: 2019-01-02 17:28:49:363
+now time is: 2019-01-02 17:28:50:363
+now time is: 2019-01-02 17:28:51:364
+now time is: 2019-01-02 17:28:52:365
+now time is: 2019-01-02 17:28:53:365
+now time is: 2019-01-02 17:28:54:365
+now time is: 2019-01-02 17:28:55:365
+now time is: 2019-01-02 17:28:56:365 // <1>
+2019-01-02 17:28:56:911: id为1308927845的Clientsocket connected
+now time is: 2019-01-02 17:28:57:913 // <2>
+now time is: 2019-01-02 17:28:58:913
+```
+
+可以看到，我们刚开始并没有客户端接入的时候，是会执行`System.out.println("now time is: " + stringNowTime());`的输出，还有一点需要注意的就是，仔细看看上面的输出结果的标记<1>与<2>，你会发现<2>处时间值不是17:28:57:365，原因就在于如果accept正常返回值的话，是不会执行catch语句部分的。
+
+## 通过Demo改造来进行read的非阻塞实现
+
+这样的话，我们就把accept部分改造成了非阻塞式了，那么read部分可以改造么？当然可以，改造方法和accept很类似，我们在read的时候，会调用 `java.net.AbstractPlainSocketImpl#getInputStream`:
+
+```java
+/**
+* Gets an InputStream for this socket.
+*/
+protected synchronized InputStream getInputStream() throws IOException {
+synchronized (fdLock) {
+    if (isClosedOrPending())
+        throw new IOException("Socket Closed");
+    if (shut_rd)
+        throw new IOException("Socket input is shutdown");
+    if (socketInputStream == null)
+        socketInputStream = new SocketInputStream(this);
+}
+return socketInputStream;
+}
+
+```
+
+这里面创建了一个`SocketInputStream`对象，会将当前`AbstractPlainSocketImpl`对象传进去，于是，在读数据的时候，我们会调用如下方法:
+
+```java
+public int read(byte b[], int off, int length) throws IOException {
+    return read(b, off, length, impl.getTimeout());
+}
+
+int read(byte b[], int off, int length, int timeout) throws IOException {
+    int n;
+
+    // EOF already encountered
+    if (eof) {
+        return -1;
+    }
+
+    // connection reset
+    if (impl.isConnectionReset()) {
+        throw new SocketException("Connection reset");
+    }
+
+    // bounds check
+    if (length <= 0 || off < 0 || length > b.length - off) {
+        if (length == 0) {
+            return 0;
+        }
+        throw new ArrayIndexOutOfBoundsException("length == " + length
+                + " off == " + off + " buffer length == " + b.length);
+    }
+
+    // acquire file descriptor and do the read
+    FileDescriptor fd = impl.acquireFD();
+    try {
+        n = socketRead(fd, b, off, length, timeout);
+        if (n > 0) {
+            return n;
+        }
+    } catch (ConnectionResetException rstExc) {
+        impl.setConnectionReset();
+    } finally {
+        impl.releaseFD();
+    }
+
+    /*
+        * If we get here we are at EOF, the socket has been closed,
+        * or the connection has been reset.
+        */
+    if (impl.isClosedOrPending()) {
+        throw new SocketException("Socket closed");
+    }
+    if (impl.isConnectionReset()) {
+        throw new SocketException("Connection reset");
+    }
+    eof = true;
+    return -1;
+}
+private int socketRead(FileDescriptor fd,
+                           byte b[], int off, int len,
+                           int timeout)
+        throws IOException {
+        return socketRead0(fd, b, off, len, timeout);
+}
+
+```
+
+这里，我们看到了socketRead同样设定了timeout，而且这个timeout就是我们创建这个`SocketInputStream`对象时传入的`AbstractPlainSocketImpl`对象来控制的，所以，我们只需要设定`socket.setSoTimeout(1000)`即可。 我们再次修改服务端代码(代码总共两次设定，第一次是设定的是ServerSocket级别的，第二次设定的客户端连接返回的那个Socket，两者不一样)：
+
+```
+public class BIOProNotBR {
+
+    public void initBIOServer(int port) {
+        ServerSocket serverSocket = null;//服务端Socket
+        Socket socket = null;//客户端socket
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        ClientSocketThread thread = null;
+        try {
+            serverSocket = new ServerSocket(port);
+            serverSocket.setSoTimeout(1000);
+            System.out.println(stringNowTime() + ": serverSocket started");
+            while (true) {
+                try {
+                    socket = serverSocket.accept();
+                } catch (SocketTimeoutException e) {
+                    //运行到这里表示本次accept是没有收到任何数据的，服务端的主线程在这里可以做一些其他事情
+                    System.out.println("now time is: " + stringNowTime());
+                    continue;
+                }
+                System.out.println(stringNowTime() + ": id为" + socket.hashCode() + "的Clientsocket connected");
+                thread = new ClientSocketThread(socket);
+                threadPool.execute(thread);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public String stringNowTime() {
+        SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss:SSS");
+        return format.format(new Date());
+    }
+
+    class ClientSocketThread extends Thread {
+        public Socket socket;
+
+        public ClientSocketThread(Socket socket) {
+            this.socket = socket;
+        }
+
+        @Override
+        public void run() {
+            BufferedReader reader = null;
+            String inputContent;
+            int count = 0;
+            try {
+                socket.setSoTimeout(1000);
+            } catch (SocketException e1) {
+                e1.printStackTrace();
+            }
+            try {
+                reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                while (true) {
+                    try {
+                        while ((inputContent = reader.readLine()) != null) {
+                            System.out.println("收到id为" + socket.hashCode() + "  " + inputContent);
+                            count++;
+                        }
+                    } catch (Exception e) {
+                        //执行到这里表示read方法没有获取到任何数据，线程可以执行一些其他的操作
+                        System.out.println("Not read data: " + stringNowTime());
+                        continue;
+                    }
+                    //执行到这里表示读取到了数据，我们可以在这里进行回复客户端的工作
+                    System.out.println("id为" + socket.hashCode() + "的Clientsocket " + stringNowTime() + "读取结束");
+                    sleep(1000);
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            } finally {
+                try {
+                    reader.close();
+                    socket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        BIOProNotBR server = new BIOProNotBR();
+        server.initBIOServer(8888);
+    }
+}
+```
+
+执行如下:
+
+```
+2019-01-02 17:59:03:713: serverSocket started
+now time is: 2019-01-02 17:59:04:714
+now time is: 2019-01-02 17:59:05:714
+now time is: 2019-01-02 17:59:06:714
+2019-01-02 17:59:06:932: id为1810132623的Clientsocket connected
+now time is: 2019-01-02 17:59:07:934
+Not read data: 2019-01-02 17:59:07:935
+now time is: 2019-01-02 17:59:08:934
+Not read data: 2019-01-02 17:59:08:935
+now time is: 2019-01-02 17:59:09:935
+Not read data: 2019-01-02 17:59:09:936
+收到id为1810132623  2019-01-02 17:59:09: 第0条消息: ccc // <1>
+now time is: 2019-01-02 17:59:10:935
+Not read data: 2019-01-02 17:59:10:981 // <2>
+收到id为1810132623  2019-01-02 17:59:11: 第1条消息: bbb
+now time is: 2019-01-02 17:59:11:935
+Not read data: 2019-01-02 17:59:12:470
+now time is: 2019-01-02 17:59:12:935
+id为1810132623的Clientsocket 2019-01-02 17:59:13:191读取结束
+now time is: 2019-01-02 17:59:13:935
+id为1810132623的Clientsocket 2019-01-02 17:59:14:192读取结束
+
+```
+
+​	其中，Not read data输出部分解决了我们的read阻塞问题，每隔1s会去唤醒我们的read操作，如果在1s内没有读到数据的话就会执行`System.out.println("Not read data: " + stringNowTime())`，在这里我们就可以进行一些其他操作了，避免了阻塞中当前线程的现象，当我们有数据发送之后，就有了<1>处的输出了，因为read得到输出，所以不再执行catch语句部分，因此你会发现<2>处输出时间是和<1>处的时间相差1s而不是和之前的17:59:09:936相差一秒；
+
+​	这样的话，我们就解决了accept以及read带来的阻塞问题了，同时在服务端为每一个客户端都创建了一个线程来处理各自的业务逻辑，这点其实基本上已经解决了阻塞问题了，我们可以理解成是最初版的NIO，但是，为每个客户端都创建一个线程这点确实让人头疼的，特别是客户端多了的话，很浪费服务器资源，再加上线程之间的切换开销，更是雪上加霜，即使你引入了线程池技术来控制线程的个数，但是当客户端多起来的时候会导致线程池的BlockingQueue队列越来越大，那么，这时候的NIO就可以为我们解决这个问题，它并不会为每个客户端都创建一个线程，在服务端只有一个线程，会为每个客户端创建一个通道。
+
+## 对accept()一些代码注意点的思考
+
+accept()本地方法，我们可以来试着看一看Linux这块的相关解读：
+
+```
+#include <sys/types.h>
+
+#include <sys/socket.h>
+
+int accept(int sockfd,struct sockaddr *addr,socklen_t *addrlen);
+
+```
+
+accept()系统调用主要用在基于连接的套接字类型，比如SOCK_STREAM和SOCK_SEQPACKET。它提取出所监听套接字的等待连接队列中第一个连接请求，**创建一个新的套接字**，并返回指向该套接字的文件描述符。新建立的套接字不在监听状态，原来所监听的套接字也不受该系统调用的影响。
+
+**备注：新建立的套接字准备发送send()和接收数据recv()。**
+
+参数：
+
+sockfd,    利用系统调用socket()建立的套接字描述符，通过bind()绑定到一个本地地址(一般为服务器的套接字)，并且通过listen()一直在监听连接；
+
+addr,    指向struct sockaddr的指针，该结构用通讯层服务器对等套接字的地址(一般为客户端地址)填写，返回地址addr的确切格式由套接字的地址类别(比如TCP或UDP)决定；若addr为NULL，没有有效地址填写，这种情况下，addrlen也不使用，应该置为NULL；
+
+**备注：addr是个指向局部数据结构sockaddr_in的指针，这就是要求接入的信息本地的套接字(地址和指针)。**
+
+addrlen,    一个值结果参数，调用函数必须初始化为包含addr所指向结构大小的数值，函数返回时包含对等地址(一般为服务器地址)的实际数值；
+
+**备注：addrlen是个局部整形变量，设置为sizeof(struct   sockaddr_in)。**
+
+如果队列中没有等待的连接，套接字也没有被标记为Non-blocking，accept()会阻塞调用函数直到连接出现；如果套接字被标记为Non-blocking，队列中也没有等待的连接，accept()返回错误EAGAIN或EWOULDBLOCK。
+
+**备注：一般来说，实现时accept()为阻塞函数，当监听socket调用accept()时，它先到自己的receive_buf中查看是否有连接数据包；若有，把数据拷贝出来，删掉接收到的数据包，创建新的socket与客户发来的地址建立连接；若没有，就阻塞等待；**
+
+为了在套接字中有到来的连接时得到通知，可以使用**select()\**或\**poll()**。当尝试建立新连接时，系统发送一个可读事件，然后调用accept()为该连接获取套接字。另一种方法是，当套接字中有连接到来时设定套接字发送SIGIO信号。
+
+返回值 成功时，返回非负整数，该整数是接收到套接字的描述符；出错时，返回－1，相应地设定全局变量errno。
+
+所以，我们在我们的Java部分的源码里(**java.net.ServerSocket#accept**)会new 一个Socket出来，方便连接后拿到的新Socket的文件描述符的信息给设定到我们new出来的这个Socket上来，这点在`java.net.PlainSocketImpl#socketAccept`中看到的尤为明显，读者可以回顾相关源码。
+
+参考 ：[linux.die.net/man/2/accep…](https://link.juejin.cn?target=http%3A%2F%2Flinux.die.net%2Fman%2F2%2Faccept)
+
+
+
