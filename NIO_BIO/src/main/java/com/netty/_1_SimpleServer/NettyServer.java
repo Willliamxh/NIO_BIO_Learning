@@ -25,7 +25,7 @@ public class NettyServer {
         那么这两个线程池是如何配合的？boss和worker的工作模式和我们平时上班，老板接活员工干活的模式是类似的。
         由bossGroup负责接待，再转交给workerGroup来处理具体的业务。
          */
-
+        //服务端引导类是ServerBootstrap，引导器指的是引导开发者更方便快速的启动Netty服务端/客户端，用到了建造者模式
         serverBootstrap
                 .group(boos, worker)
                 .channel(NioServerSocketChannel.class)
