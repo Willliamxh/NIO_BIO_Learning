@@ -27,6 +27,7 @@ public class NettyServer {
          */
         //服务端引导类是ServerBootstrap，引导器指的是引导开发者更方便快速的启动Netty服务端/客户端，用到了建造者模式
         serverBootstrap
+                //group方法绑定boos和work使其各司其职，这个操作可以看作是绑定线程池。
                 .group(boos, worker)
                 .channel(NioServerSocketChannel.class)
                 .childHandler(new ChannelInitializer<NioSocketChannel>() {
