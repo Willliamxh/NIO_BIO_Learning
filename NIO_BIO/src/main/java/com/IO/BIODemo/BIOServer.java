@@ -1,4 +1,4 @@
-package com.xuhan.BIODemo;
+package com.IO.BIODemo;
 
 import java.io.*;
 import java.net.ServerSocket;

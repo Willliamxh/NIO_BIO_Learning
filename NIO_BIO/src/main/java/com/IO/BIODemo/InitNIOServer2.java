@@ -1,4 +1,4 @@
-package com.xuhan.BIODemo;
+package com.IO.BIODemo;
 
 import java.io.BufferedReader;
 import java.io.IOException;

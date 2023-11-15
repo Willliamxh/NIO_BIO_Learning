@@ -32,6 +32,8 @@ Reactor源码解读与分享：[www.bilibili.com/video/av353…](https://link.ju
 
 2.https://juejin.cn/post/6995519558475841550
 
+3.https://juejin.cn/post/6988090026361880613?searchId=20231114164704A095465B83A451FD1510#heading-13
+
 DMA：
 
 https://juejin.cn/post/7031187738871365646?searchId=202311141127586A567CA2D35EB5CA1225
