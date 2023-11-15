@@ -54,7 +54,7 @@ public class BIOServer {
 
     public static void main(String[] args) {
         BIOServer server = new BIOServer();
-        server.initBIOServer(8888);
+        server.initBIOServer(56780);
 
     }
 }

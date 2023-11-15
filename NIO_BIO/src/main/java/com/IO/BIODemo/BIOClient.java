@@ -49,7 +49,7 @@ public class BIOClient {
 
     public static void main(String[] args) {
         BIOClient client = new BIOClient();
-        client.initBIOClient("127.0.0.1", 8888);
+        client.initBIOClient("127.0.0.1", 2);
     }
 
 }
