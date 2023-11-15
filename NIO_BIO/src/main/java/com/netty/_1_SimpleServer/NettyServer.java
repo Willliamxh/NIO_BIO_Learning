@@ -1,10 +1,13 @@
 package com.netty._1_SimpleServer;
 
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
+import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.string.StringDecoder;
 
 /**
  * @author XuHan
@@ -29,10 +32,20 @@ public class NettyServer {
         serverBootstrap
                 //group方法绑定boos和work使其各司其职，这个操作可以看作是绑定线程池。
                 .group(boos, worker)
+                //设置底层编程模型或者说底层通信模式，一旦设置中途不允许更改。
                 .channel(NioServerSocketChannel.class)
+                //childHandler方法主要作用是初始化和定义处理链来处理请求处理的细节。
                 .childHandler(new ChannelInitializer<NioSocketChannel>() {
                     protected void initChannel(NioSocketChannel ch) {
-
+                        //Handler负责处理一个I/O事件或拦截一个I/O操作，处理完成将其转发给其ChannelPipeline中的下一个处理Handler，以此形成经典的处理链条。
+                        ch.pipeline().addLast(new StringDecoder());
+                        //比如案例里面StringDecoder解码处理数据之后将会交给SimpleChannelInboundHandler的channelRead0方法，该方法中将解码读取到的数据打印到控制台。
+                        ch.pipeline().addLast(new SimpleChannelInboundHandler<String>() {
+                            @Override
+                            protected void channelRead0(ChannelHandlerContext ctx, String msg) {
+                                System.out.println(msg);
+                            }
+                        });
                     }
                 })
                 .bind(8000);
